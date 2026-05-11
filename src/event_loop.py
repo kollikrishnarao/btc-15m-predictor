@@ -1,26 +1,28 @@
 """
-Main event loop — the BTC Predictor orchestrator.
-Runs on every 15m candle close from Binance WS.
-Coordinates: data assembly → pre-filter → advisor + reasoning (parallel) → decision → execution.
+Main event loop — BTC Predictor v4.0 Orchestrator.
+Coordinates: data assembly → pre-filter → specialist agents → Governor → execution.
 """
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import signal
 import uuid
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Optional
 
-import anthropic
 import structlog
 
 from config import constants as C
-from config.constants import ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL, BRAINS
+from config.constants import ANTHROPIC_API_KEY
 from src.alerts.telegram_alerts import TelegramAlerts
 from src.agents.advisor import AdvisorAgent, AdvisorOpinion
+from src.agents.base.base_agent import AgentSignal
+from src.agents.governor.governor import DIMENSION_WEIGHTS, GovernorAgent, GovernorDecision
+from src.agents.specialists.quant_master import QuantMaster
+from src.agents.specialists.flow_master import FlowMaster
+from src.agents.specialists.macro_monarch import MacroMonarch
+from src.agents.specialists.sentiment_scout import SentimentScout
 from src.data_sources.binance_client import BinanceClient, Candle
 from src.dynamic_flip import FlipDecision, evaluate_flip
 from src.execution.polymarket_client import PolymarketClient
@@ -40,18 +42,17 @@ log = structlog.get_logger(__name__)
 
 class BTCPredictor:
     """
-    Main orchestrator for the BTC 15m Direction Predictor.
+    Main orchestrator for the BTC 15m Direction Predictor v4.0.
 
     Flow per 15m cycle:
       1. Wait for Binance WS kline_15m close event
       2. Assemble MarketState (parallel data fetch)
       3. Run PreFilter (hard rules)
-      4. If passed: run Advisor + Reasoning in parallel
-      5. Reconcile → final call
+      4. If passed: run all 5 specialists + Advisor in parallel
+      5. Governor reconciles → final call
       6. If ENTER: open session, place bet
       7. Wait for C2/C3/C4 close → resolve bets
-      8. Log outcome, update reflection
-      9. Repeat
+      8. Log outcome, run reflection, repeat
     """
 
     def __init__(self, dry_run: bool = True):
@@ -62,36 +63,32 @@ class BTCPredictor:
         # Components
         self.binance: Optional[BinanceClient] = None
         self.assembler: Optional[MarketStateAssembler] = None
-        self.advisor: Optional[AdvisorAgent] = None
-        self.session_mgr: SessionManager = SessionManager()
-        self.logger: PredictionLogger = PredictionLogger()
+        self.session_mgr = SessionManager()
+        self.logger = PredictionLogger()
         self.polymarket: Optional[PolymarketClient] = None
         self.alerts: Optional[TelegramAlerts] = None
 
+        # Agents
+        self.advisor: Optional[AdvisorAgent] = None
+        self.governor: Optional[GovernorAgent] = None
+        self.quant: Optional[QuantMaster] = None
+        self.flow_master: Optional[FlowMaster] = None
+        self.macro_monarch: Optional[MacroMonarch] = None
+        self.sentiment_scout: Optional[SentimentScout] = None
+
         # State
-        self._current_market: Optional[MarketState] = None
         self._analysis_count = 0
         self._uuid_counter = 0
-        self._c2_candle: Optional[Candle] = None
-        self._c3_candle: Optional[Candle] = None
-        self._c4_candle: Optional[Candle] = None
-        self._bet_resolution_tasks: list[asyncio.Task] = []
-
-        # Anthropic client for my reasoning
-        self._anthropic: Optional[anthropic.AsyncAnthropic] = None
-        if ANTHROPIC_API_KEY:
-            self._anthropic = anthropic.AsyncAnthropic(
-                api_key=ANTHROPIC_API_KEY,
-                base_url=ANTHROPIC_BASE_URL,
-            )
+        self._current_decision: Optional[GovernorDecision] = None
 
     # ── Lifecycle ─────────────────────────────────────────────────────────
 
     async def start(self):
-        """Start the predictor — connect to all data sources."""
-        log.info("BTC Predictor starting...", dry_run=self.dry_run)
+        """Start the predictor — connect all data sources and agents."""
+        log.info("BTC Predictor v4.0 starting...", dry_run=self.dry_run)
 
         self.binance = BinanceClient()
+        await self.binance.__aenter__()
         self.assembler = MarketStateAssembler(self.binance)
 
         self.polymarket = PolymarketClient(
@@ -101,47 +98,71 @@ class BTCPredictor:
         if C.TELEGRAM_BOT_TOKEN and C.TELEGRAM_CHAT_ID:
             self.alerts = TelegramAlerts()
 
-        if ANTHROPIC_API_KEY and C.ANTHROPIC_ADVISOR_KEY:
+        if ANTHROPIC_API_KEY:
+            # Start all agents
             self.advisor = AdvisorAgent()
+            await self.advisor.__aenter__()
+
+            self.governor = GovernorAgent()
+            await self.governor.__aenter__()
+
+            self.quant = QuantMaster()
+            await self.quant.__aenter__()
+
+            self.flow_master = FlowMaster()
+            await self.flow_master.__aenter__()
+
+            self.macro_monarch = MacroMonarch()
+            await self.macro_monarch.__aenter__()
+
+            self.sentiment_scout = SentimentScout()
+            await self.sentiment_scout.__aenter__()
 
         self.running = True
 
-        # Load any active session from disk
+        # Resume any active session
         state = await self.session_mgr.load()
         if state.is_active:
             log.info(f"Resuming active session: {state.summary()}")
 
-        log.info("BTC Predictor started. Waiting for 15m candle close...")
+        log.info("BTC Predictor v4.0 started. Waiting for 15m candle close...")
 
     async def stop(self):
         """Graceful shutdown."""
         log.info("BTC Predictor shutting down...")
         self.running = False
         self._shutdown.set()
+
+        for agent in [self.quant, self.flow_master, self.macro_monarch,
+                       self.sentiment_scout, self.advisor, self.governor]:
+            if agent:
+                try:
+                    await agent.__aexit__(None, None, None)
+                except Exception:
+                    pass
+
         if self.binance:
             await self.binance.__aexit__(None, None, None)
+
         if self.polymarket:
             await self.polymarket.__aexit__(None, None, None)
-        if self.alerts:
-            await self.alerts.__aexit__(None, None, None)
 
-    # ── Main Loop ────────────────────────────────────────────────────────
+    # ── Main Loop ───────────────────────────────────────────────────────
 
     async def run(self):
         """Main run loop — subscribes to Binance 15m kline WS stream."""
         await self.start()
 
-        # Seed the trade buffer with recent trades for orderflow metrics
+        # Seed trade buffer
         try:
             recent_trades = await self.binance.fetch_recent_trades(limit=500)
             self.binance.seed_trade_buffer(recent_trades)
-            log.info(f"Trade buffer seeded with {len(recent_trades)} recent trades")
+            log.info(f"Trade buffer seeded with {len(recent_trades)} trades")
         except Exception as e:
             log.warning(f"Failed to seed trade buffer: {e}")
 
         kline_q = await self.binance.subscribe_kline("15m")
 
-        # Keep polling for candle closes
         while self.running:
             try:
                 candle: Candle = await asyncio.wait_for(kline_q.get(), timeout=120)
@@ -155,10 +176,7 @@ class BTCPredictor:
                 await asyncio.sleep(5)
 
     async def _on_candle_close(self, candle: Candle):
-        """
-        Called on every 15m candle close (C1).
-        This is the main analysis trigger.
-        """
+        """Called on every 15m candle close (C1)."""
         self._uuid_counter += 1
         analysis_id = f"{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M')}_{self._uuid_counter:03d}"
         self._analysis_count += 1
@@ -192,216 +210,171 @@ class BTCPredictor:
         pf_result.log()
 
         if not pf_result.passed:
-            await self._alert_if_needed(
-                "analysis_skipped",
-                reason=pf_result.reason.value,
-                confidence=0.0,
-                candle_id=analysis_id,
-            )
+            await self._alert_skipped(pf_result, analysis_id, state)
             return
 
-        # ── Step 4: Parallel reasoning ────────────────────────────────────
-        advisor_opinion = None
-        reasoning_output = None
+        # ── Step 4: Parallel specialist + advisor analysis ───────────────────
+        specialist_signals = await self._run_specialists(state, reflection)
 
-        # Run advisor + reasoning in parallel
-        tasks = []
-        advisor_task = None
-        reasoning_task = None
+        # ── Step 5: Governor decision ────────────────────────────────────────
+        decision = await self._run_governor(state, specialist_signals, reflection)
 
-        if self.advisor and self._anthropic:
-            advisor_task = asyncio.create_task(
-                self.advisor.analyze(state, reflection)
-            )
-            tasks.append(advisor_task)
-
-        if self._anthropic:
-            system_prompt, user_prompt = build_reasoning_prompt(
-                state, reflection,
-                advisor_opinion=None,  # advisor hasn't responded yet
-            )
-            reasoning_task = asyncio.create_task(
-                self._call_reasoning_engine(system_prompt, user_prompt)
-            )
-            tasks.append(reasoning_task)
-
-        if not tasks:
-            log.error("No reasoning engine configured — set ANTHROPIC_API_KEY")
-            return
-
-        # Wait for both to complete
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        # Parse results
-        if advisor_task and not isinstance(results[0], Exception):
-            advisor_opinion = results[0]
-        if reasoning_task and not isinstance(results[-1], Exception):
-            reasoning_output = results[-1]
-
-        # If advisor finished first, rebuild prompt with advisor's view
-        if self.advisor and advisor_task.done() and not advisor_task.exception():
-            advisor_opinion = advisor_task.result()
-            if reasoning_task and not reasoning_task.done():
-                # Restart reasoning with advisor's opinion included
-                reasoning_task.cancel()
-                system_prompt, user_prompt = build_reasoning_prompt(
-                    state, reflection,
-                    advisor_opinion={
-                        "call": advisor_opinion.call,
-                        "confidence": advisor_opinion.confidence,
-                        "key_signals": advisor_opinion.key_signals,
-                        "risk_flags": advisor_opinion.risk_flags,
-                        "advisor_strength": advisor_opinion.advisor_strength,
-                        "regime": advisor_opinion.regime,
-                    },
-                )
-                reasoning_output = await self._call_reasoning_engine(system_prompt, user_prompt)
-
-        if not reasoning_output:
-            log.error("Reasoning engine failed — skipping this cycle")
-            return
-
-        # ── Step 5: Reconcile with advisor ─────────────────────────────────
-        reasoning_output = self._reconcile_advisor(reasoning_output, advisor_opinion)
-
-        # ── Step 6: Apply confidence gate ─────────────────────────────────
-        call = reasoning_output.call
-        confidence = reasoning_output.weighted_confidence
-        bucket = reasoning_output.confidence_bucket
-
-        if bucket == "LOW" or confidence < C.CONFIDENCE_MEDIUM:
-            log.info(f"Confidence {confidence:.2f} below threshold — SKIP")
-            await self.logger.log_analysis(
-                analysis_id=analysis_id,
-                timestamp=datetime.now(timezone.utc).isoformat(),
-                direction=call, confidence=confidence,
-                confidence_bucket=bucket,
-                signal_scores=reasoning_output.signal_scores,
-                advisor_call=advisor_opinion.call if advisor_opinion else "N/A",
-                advisor_confidence=advisor_opinion.confidence if advisor_opinion else 0.0,
-                advisor_strength=advisor_opinion.advisor_strength if advisor_opinion else "N/A",
-                locked_direction=call,
-                current_direction=call,
-                pre_filter_reason=pf_result.reason.value if pf_result.reason else "PASSED",
-                reasoning_json=reasoning_output.analysis,
-                market_price=0.0,
-                market_url="",
-                c1_price=state.current_price,
-                c1_pattern=state.c1.candle_pattern if state.c1 else "N/A",
-                rsi_14=state.technical.rsi_14 if state.technical else 0.0,
-                vpin=state.vpin,
-                cvd=state.cvd,
-                funding_rate=state.smart_money.funding_rate_pct if state.smart_money else 0.0,
-                fear_greed=state.sentiment.fear_greed_index if state.sentiment else 50,
-                regime=reasoning_output.analysis.get("regime", "UNKNOWN"),
-            )
+        # ── Step 6: Apply confidence gate + execute ─────────────────────────
+        if decision.call == "SKIP":
+            log.info(f"Governor SKIP — confidence={decision.weighted_confidence:.2f}")
+            await self._log_analysis(analysis_id, decision, state, reflection, pf_result, specialist_signals)
             return
 
         # ── Step 7: Enter session ──────────────────────────────────────────
-        await self._enter_session(
-            analysis_id=analysis_id,
-            state=state,
-            reasoning_output=reasoning_output,
-            advisor_opinion=advisor_opinion,
-            reflection=reflection,
-            pf_result=pf_result,
-        )
+        await self._enter_session(analysis_id, state, decision, reflection, pf_result, specialist_signals)
 
-    # ── Reasoning Engine ──────────────────────────────────────────────────
+    # ── Specialist Agents ────────────────────────────────────────────────
 
-    async def _call_reasoning_engine(
+    async def _run_specialists(
         self,
-        system_prompt: str,
-        user_prompt: str,
-    ) -> ReasoningOutput:
-        """Call Anthropic to get my reasoning output."""
-        if not self._anthropic:
-            return ReasoningOutput(
-                call="SKIP", confidence=0.50, confidence_bucket="LOW",
-                signal_scores={}, dimension_weights={}, weighted_confidence=0.50,
-                advisor_reconciliation={}, analysis={},
-                contradictions=[], key_bullish_signals=[],
-                key_bearish_signals=[], risk_factors=[],
-                flip_consideration={},
-            )
+        state: MarketState,
+        reflection: dict,
+    ) -> dict[str, AgentSignal]:
+        """Run all specialist agents in parallel."""
+        specialists = [
+            ("quant", self.quant),
+            ("flow_master", self.flow_master),
+            ("macro_monarch", self.macro_monarch),
+            ("sentiment_scout", self.sentiment_scout),
+        ]
 
-        model = BRAINS["reasoning"]["model"]
-        max_tokens = BRAINS["reasoning"]["max_tokens"]
-        temperature = BRAINS["reasoning"]["temperature"]
+        tasks = {}
+        for name, agent in specialists:
+            if agent:
+                tasks[name] = asyncio.create_task(agent.analyze(state, reflection))
+
+        results = {}
+        for name, task in tasks.items():
+            try:
+                signal = await task
+                results[name] = signal
+                log.debug(f"  {name.upper()}: score={signal.score:.3f} conf={signal.confidence:.2f}")
+            except Exception as e:
+                log.warning(f"  {name.upper()} failed: {e}")
+                results[name] = AgentSignal(
+                    dimension=name,
+                    score=0.5,
+                    confidence=0.0,
+                    regime="UNKNOWN",
+                    key_signals=[f"Agent failed: {e}"],
+                )
+
+        # Fallback: if no specialists ran, use LLM reasoning engine directly
+        if not results:
+            log.warning("No specialists available — using fallback reasoning")
+            return await self._fallback_reasoning(state, reflection)
+
+        return results
+
+    async def _fallback_reasoning(
+        self,
+        state: MarketState,
+        reflection: dict,
+    ) -> dict[str, AgentSignal]:
+        """Fallback when no specialist agents are available."""
+        from src.reasoning_prompt import build_reasoning_prompt, parse_reasoning_output
+        import anthropic
+
+        if not ANTHROPIC_API_KEY:
+            return {
+                "fallback": AgentSignal(
+                    dimension="fallback",
+                    score=0.5,
+                    confidence=0.0,
+                    regime="UNKNOWN",
+                    key_signals=["No reasoning engine available"],
+                )
+            }
 
         try:
-            response = await self._anthropic.messages.create(
-                model=model,
-                max_tokens=max_tokens,
-                temperature=temperature,
+            client = anthropic.AsyncAnthropic(
+                api_key=ANTHROPIC_API_KEY,
+                base_url=C.ANTHROPIC_BASE_URL,
+            )
+            system_prompt, user_prompt = build_reasoning_prompt(state, reflection)
+            resp = await client.messages.create(
+                model="claude-sonnet-4-6",
+                max_tokens=1024,
                 system=system_prompt,
                 messages=[{"role": "user", "content": user_prompt}],
             )
+            await client.aclose()
 
             raw = ""
-            for block in response.content:
+            for block in resp.content:
                 if block.type == "text":
                     raw += block.text
 
-            return parse_reasoning_output(raw)
-
+            output = parse_reasoning_output(raw)
+            return {
+                "momentum": AgentSignal("momentum", output.signal_scores.get("momentum", 0.5), 0.6, "UNKNOWN"),
+                "trend": AgentSignal("trend", output.signal_scores.get("trend", 0.5), 0.6, "UNKNOWN"),
+                "orderflow": AgentSignal("orderflow", output.signal_scores.get("orderflow", 0.5), 0.6, "UNKNOWN"),
+                "smart_money": AgentSignal("smart_money", output.signal_scores.get("smart_money", 0.5), 0.6, "UNKNOWN"),
+                "sentiment": AgentSignal("sentiment", output.signal_scores.get("sentiment", 0.5), 0.6, "UNKNOWN"),
+                "macro": AgentSignal("macro", output.signal_scores.get("macro", 0.5), 0.6, "UNKNOWN"),
+            }
         except Exception as e:
-            log.error(f"Reasoning engine call failed: {e}")
-            return ReasoningOutput(
-                call="SKIP", confidence=0.50, confidence_bucket="LOW",
-                signal_scores={}, dimension_weights={}, weighted_confidence=0.50,
-                advisor_reconciliation={}, analysis={},
-                contradictions=[], key_bullish_signals=[],
-                key_bearish_signals=[], risk_factors=[],
-                flip_consideration={},
-                raw_response=f"Error: {e}",
-            )
+            log.error(f"Fallback reasoning failed: {e}")
+            return {}
 
-    def _reconcile_advisor(
+    # ── Governor ────────────────────────────────────────────────────────
+
+    async def _run_governor(
         self,
-        reasoning: ReasoningOutput,
-        advisor: Optional[AdvisorOpinion],
-    ) -> ReasoningOutput:
-        """
-        Reconcile my reasoning with the advisor's opinion.
-        If advisor disagrees significantly, lean toward the conservative call
-        unless my confidence is >0.15 higher.
-        """
-        if not advisor or advisor.call == "SKIP" or advisor.call == reasoning.call:
-            reasoning.advisor_reconciliation = {
-                "advisor_called": advisor.call if advisor else "SKIP",
-                "advisor_confidence": advisor.confidence if advisor else 0.50,
-                "agreed": True,
-                "conservative_override": False,
-                "override_reason": "",
-            }
-            return reasoning
+        state: MarketState,
+        specialist_signals: dict[str, AgentSignal],
+        reflection: dict,
+    ) -> GovernorDecision:
+        """Run Governor decision process."""
+        t0 = asyncio.get_event_loop().time()
 
-        # Disagreement
-        conf_gap = reasoning.weighted_confidence - advisor.confidence
-        if conf_gap > 0.15:
-            # My confidence is significantly higher — stick with my call
-            reasoning.advisor_reconciliation = {
-                "advisor_called": advisor.call,
-                "advisor_confidence": advisor.confidence,
-                "agreed": False,
-                "conservative_override": False,
-                "override_reason": f"My confidence {conf_gap:.2f} higher than advisor",
-            }
-        else:
-            # Advisor disagrees — flip to conservative call
-            original_call = reasoning.call
-            reasoning.call = advisor.call
-            reasoning.advisor_reconciliation = {
-                "advisor_called": advisor.call,
-                "advisor_confidence": advisor.confidence,
-                "agreed": False,
-                "conservative_override": True,
-                "override_reason": "Advisor disagreed with lower confidence — conservative override",
-            }
-            log.info(f"Advisor override: {original_call} → {reasoning.call}")
+        if not self.governor:
+            # Fallback: simple weighted average
+            return self._simple_decision(specialist_signals)
 
-        return reasoning
+        try:
+            decision = await self.governor.make_decision(
+                state, specialist_signals, reflection
+            )
+            latency = (asyncio.get_event_loop().time() - t0) * 1000
+            decision.latency_ms = latency
+            self._current_decision = decision
+            return decision
+        except Exception as e:
+            log.error(f"Governor decision failed: {e}")
+            return self._simple_decision(specialist_signals)
+
+    def _simple_decision(self, signals: dict[str, AgentSignal]) -> GovernorDecision:
+        """Simple weighted average fallback."""
+        total = 0.0
+        for dim, weight in DIMENSION_WEIGHTS.items():
+            if dim in signals:
+                total += signals[dim].score * weight
+            else:
+                total += 0.5 * weight
+
+        conf = round(total, 3)
+        bucket = "HIGH" if conf >= C.CONFIDENCE_HIGH else "MEDIUM" if conf >= C.CONFIDENCE_MEDIUM else "LOW"
+        call = "SKIP" if bucket == "LOW" else ("GREEN" if conf > 0.52 else "RED")
+
+        return GovernorDecision(
+            call=call,
+            weighted_confidence=conf,
+            confidence_bucket=bucket,
+            signal_scores={dim: s.score for dim, s in signals.items()},
+            advisor_reconciliation={"advisor_call": "SKIP", "agreed": True},
+            regime="UNKNOWN",
+            analysis={},
+            contradictions=[],
+            key_signals=[],
+            risk_factors=[],
+        )
 
     # ── Session Entry ───────────────────────────────────────────────────
 
@@ -409,14 +382,14 @@ class BTCPredictor:
         self,
         analysis_id: str,
         state: MarketState,
-        reasoning_output: ReasoningOutput,
-        advisor_opinion: Optional[AdvisorOpinion],
+        decision: GovernorDecision,
         reflection: dict,
         pf_result: PreFilterResult,
+        specialist_signals: dict[str, AgentSignal],
     ):
-        """Open a new session and place the first bet (on C2)."""
-        direction = reasoning_output.call
-        confidence = reasoning_output.weighted_confidence
+        """Open a new session and place the first bet."""
+        direction = decision.call
+        confidence = decision.weighted_confidence
 
         log.info(f"=== ENTER SESSION: {direction} @ {confidence:.2f} ===")
 
@@ -443,78 +416,56 @@ class BTCPredictor:
             log.warning(f"Polymarket market discovery failed: {e}")
 
         # Compute bet size
-        bankroll = 1000.0  # TODO: track actual bankroll
         bet_size = self.polymarket.compute_bet_size(
             confidence=confidence,
             market_price=market_price,
-            bankroll=bankroll,
-        ) if self.polymarket else 10.0
+            bankroll=1000.0,
+        ) if self.polymarket else 1.0
 
         # Place bet
-        async with PolymarketClient() as pm:
-            result = await pm.place_order(
-                market=market,
-                direction=direction,
-                size=bet_size,
-                market_price=market_price,
-            )
+        result = None
+        try:
+            async with PolymarketClient() as pm:
+                result = await pm.place_order(
+                    market=market,
+                    direction=direction,
+                    size=bet_size,
+                    market_price=market_price,
+                )
+        except Exception as e:
+            log.warning(f"Bet placement failed: {e}")
 
-        # Record bet in session
+        # Record bet
         await self.session_mgr.place_bet(
             candle_label="C2",
             direction=direction,
             confidence=confidence,
-            market_price=result.filled_price or market_price,
-            bet_amount=result.filled_size or bet_size,
+            market_price=(result.filled_price or market_price) if result else market_price,
+            bet_amount=(result.filled_size or bet_size) if result else bet_size,
         )
 
         # Log analysis
-        await self.logger.log_analysis(
-            analysis_id=analysis_id,
-            timestamp=datetime.now(timezone.utc).isoformat(),
-            direction=direction,
-            confidence=confidence,
-            confidence_bucket=reasoning_output.confidence_bucket,
-            signal_scores=reasoning_output.signal_scores,
-            advisor_call=advisor_opinion.call if advisor_opinion else "N/A",
-            advisor_confidence=advisor_opinion.confidence if advisor_opinion else 0.0,
-            advisor_strength=advisor_opinion.advisor_strength if advisor_opinion else "N/A",
-            locked_direction=direction,
-            current_direction=direction,
-            pre_filter_reason="PASSED",
-            reasoning_json=reasoning_output.analysis,
-            market_price=result.filled_price or market_price,
-            market_url=result.market_url or market_url,
-            c1_price=state.current_price,
-            c1_pattern=state.c1.candle_pattern if state.c1 else "N/A",
-            rsi_14=state.technical.rsi_14 if state.technical else 0.0,
-            vpin=state.vpin,
-            cvd=state.cvd,
-            funding_rate=state.smart_money.funding_rate_pct if state.smart_money else 0.0,
-            fear_greed=state.sentiment.fear_greed_index if state.sentiment else 50,
-            regime=reflection.get("regime", "UNKNOWN"),
-        )
+        await self._log_analysis(analysis_id, decision, state, reflection, pf_result, specialist_signals)
 
         # Alert
-        rationale = " | ".join(
-            f"{k}: {v:.2f}" for k, v in reasoning_output.signal_scores.items()
-        )
         if self.alerts:
+            rationale = " | ".join(f"{k}: {v:.2f}" for k, v in decision.signal_scores.items())
             await self.alerts.session_started(
                 direction=direction,
                 confidence=confidence,
                 rationale=rationale,
-                market_url=result.market_url or market_url,
+                market_url=market_url,
                 regime=reflection.get("regime", "UNKNOWN"),
             )
-            await self.alerts.bet_placed(
-                candle="C2",
-                direction=direction,
-                price=result.filled_price or market_price,
-                size=result.filled_size or bet_size,
-                market_url=result.market_url or market_url,
-                bet_number=1,
-            )
+            if result:
+                await self.alerts.bet_placed(
+                    candle="C2",
+                    direction=direction,
+                    price=result.filled_price or market_price,
+                    size=result.filled_size or bet_size,
+                    market_url=market_url,
+                    bet_number=1,
+                )
 
         # Schedule C2 resolution
         asyncio.create_task(self._wait_and_resolve_candle("C2"))
@@ -522,43 +473,35 @@ class BTCPredictor:
     # ── Candle Resolution ────────────────────────────────────────────────
 
     async def _wait_and_resolve_candle(self, label: str):
-        """Wait for the target candle to close, then resolve the bet."""
-        # Wait for the candle to form:
-        # C1 close at T → bet placed → wait 15 minutes for C{N} to close
+        """Wait for target candle to close, then resolve."""
         candle_map = {"C2": 1, "C3": 2, "C4": 3}
         wait_for = candle_map.get(label, 1)
-        await asyncio.sleep(5)  # Small buffer for WS latency
+        await asyncio.sleep(8)  # Buffer for WS latency
 
-        # Get the closed candle from Binance
         try:
             candles = await self.binance.fetch_klines(limit=5)
             if len(candles) >= wait_for + 1:
-                target_candle = candles[-(wait_for)]
-                await self._resolve_candle(label, target_candle)
+                target = candles[-wait_for]
+                await self._resolve_candle(label, target)
         except Exception as e:
-            log.error(f"Failed to fetch {label} candle for resolution: {e}")
+            log.error(f"Failed to fetch {label}: {e}")
 
     async def _resolve_candle(self, label: str, candle: Candle):
-        """Resolve the bet on a candle and handle session state."""
+        """Resolve a bet on a candle."""
         session_state = await self.session_mgr.load()
         if not session_state.is_active:
             return
 
-        # Determine if bet won
         direction = session_state.current_direction
         is_green = candle.is_green
         won = (direction == "GREEN" and is_green) or (direction == "RED" and not is_green)
 
-        log.info(f"{label} RESOLVED: close={candle.close:.1f} "
-                 f"open={candle.open:.1f} {'GREEN' if is_green else 'RED'} "
+        log.info(f"{label} RESOLVED: {'GREEN' if is_green else 'RED'} "
                  f"→ {'✅ WIN' if won else '❌ LOSS'} (bet={direction})")
 
-        # Resolve the bet
         await self.session_mgr.resolve_bet(won=won, close_price=candle.close)
 
-        # Alert
         if self.alerts:
-            session_state = await self.session_mgr.load()
             await self.alerts.bet_resolved(
                 candle=label,
                 won=won,
@@ -568,43 +511,31 @@ class BTCPredictor:
             )
 
         if won:
-            # Session WON
             await self._handle_session_won(candle, session_state)
         elif session_state.bets_remaining > 0:
-            # Session continues — check for flip
             await self._check_flip_and_continue(candle, session_state)
         else:
-            # Session LOST — all 3 bets exhausted
             await self._handle_session_lost(candle, session_state)
 
     async def _check_flip_and_continue(self, candle: Candle, session_state):
-        """After a loss, evaluate whether to flip direction."""
-        # Get current market state for counter-signals
-        analysis_id = f"{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
+        """After a loss, evaluate flip conditions."""
         try:
-            state = await self.assembler.assemble(analysis_id)
+            state = await self.assembler.assemble(f"flip_check_{datetime.now().strftime('%Y%m%d%H%M%S')}")
         except Exception as e:
-            log.warning(f"MarketState fetch for flip check failed: {e}")
-            # Continue with current direction
+            log.warning(f"Flip check failed: {e}")
             asyncio.create_task(self._wait_and_resolve_candle(session_state.next_candle))
             return
 
-        # Evaluate flip
-        loss_candle = session_state.next_candle  # The next one to bet on
-        advisor_conf = 0.50
-        cvd_diverging = state.cvd > 0 if session_state.current_direction == "RED" else state.cvd < 0
-        funding_reversal = False  # TODO: detect funding reversal
-
         flip_eval = evaluate_flip(
             original_direction=session_state.locked_direction,
-            loss_candle=loss_candle,
-            loss_reason=f"C{len(session_state.bets)} loss",
+            loss_candle=session_state.next_candle,
+            loss_reason=f"{session_state.next_candle} loss",
             original_confidence=session_state.bets[-1].confidence if session_state.bets else 0.60,
-            counter_signal_strength=0.55,  # TODO: compute from state
-            advisor_flip_confidence=advisor_conf,
+            counter_signal_strength=0.55,
+            advisor_flip_confidence=0.50,
             vpin=state.vpin,
-            cvd_diverging=cvd_diverging,
-            funding_reversal=funding_reversal,
+            cvd_diverging=(state.cvd > 0) if session_state.current_direction == "RED" else (state.cvd < 0),
+            funding_reversal=False,
             new_technical_breakdown=False,
         )
 
@@ -615,27 +546,22 @@ class BTCPredictor:
                 confidence=0.60,
             )
             log.warning(f"DIRECTION FLIPPED: {session_state.current_direction} → {flip_eval.flip_direction}")
-        elif flip_eval.decision == "SKIP":
-            log.info(f"Flip uncertain — skipping remaining bets")
-            await self.session_mgr.end_session(total_pnl=0.0)
-            return
+            if self.alerts:
+                await self.alerts.send_message(
+                    f"⚠️ DIRECTION FLIPPED: {session_state.current_direction} → {flip_eval.flip_direction}\n"
+                    f"Reason: {flip_eval.trigger_reason}"
+                )
 
-        # Place next bet
-        next_candle = session_state.next_candle
-        if next_candle:
-            asyncio.create_task(self._wait_and_resolve_candle(next_candle))
+        asyncio.create_task(self._wait_and_resolve_candle(session_state.next_candle))
 
     async def _handle_session_won(self, winning_candle: Candle, session_state):
         """Handle a won session."""
         bets = session_state.bets
-        won_bet = next((b for b in bets if b.won), bets[-1])
+        won_bet = next((b for b in reversed(bets) if b.won), bets[-1])
         market_price = won_bet.market_price if won_bet else 0.50
-        bet_amount = won_bet.bet_amount if won_bet else 10.0
+        bet_amount = won_bet.bet_amount if won_bet else 1.0
         pnl = bet_amount / max(market_price, 0.01) - bet_amount
 
-        session_state.total_pnl = pnl
-
-        # Log outcome
         await self.logger.log_session_outcome(
             analysis_id=session_state.analysis_id,
             session_won=True,
@@ -648,7 +574,6 @@ class BTCPredictor:
             flip_occurred=session_state.flip_occurred,
         )
 
-        # Alert
         if self.alerts:
             await self.alerts.session_won(
                 winning_candle=won_bet.candle_label,
@@ -661,51 +586,92 @@ class BTCPredictor:
         await self.session_mgr.reset()
 
     async def _handle_session_lost(self, last_candle: Candle, session_state):
-        """Handle a lost session (all 3 bets exhausted)."""
-        bets = session_state.bets
-        total_loss = sum(b.bet_amount for b in bets)
+        """Handle a lost session."""
+        total_loss = sum(b.bet_amount for b in session_state.bets)
 
-        # Log outcome
         await self.logger.log_session_outcome(
             analysis_id=session_state.analysis_id,
             session_won=False,
             session_lost=True,
             winning_candle="",
-            total_bets=len(bets),
+            total_bets=len(session_state.bets),
             total_pnl=-total_loss,
             winning_candles=[],
-            losing_candles=[b.candle_label for b in bets],
+            losing_candles=[b.candle_label for b in session_state.bets],
             flip_occurred=session_state.flip_occurred,
         )
 
-        # Check circuit breaker
         stats = await self.logger.compute_stats()
-        if self.alerts and stats.get("consecutive_losses", 0) >= 3:
-            await self.alerts.circuit_breaker(
-                consecutive_losses=stats["consecutive_losses"],
-                reason="3 consecutive losses",
-                edge_required="$0.05",
-            )
-
-        # Alert
         if self.alerts:
+            if stats.get("consecutive_losses", 0) >= 3:
+                await self.alerts.circuit_breaker(
+                    consecutive_losses=stats["consecutive_losses"],
+                    reason="3 consecutive losses",
+                    edge_required="$0.05",
+                )
             await self.alerts.session_lost(
                 total_loss=total_loss,
                 direction=session_state.locked_direction,
                 all_bets=[{"candle": b.candle_label, "won": bool(b.won),
-                           "close_price": b.close_price or 0.0} for b in bets],
+                           "close_price": b.close_price or 0.0} for b in session_state.bets],
             )
 
         await self.session_mgr.reset()
 
     async def _handle_active_session(self, candle: Candle, session_state):
-        """Handle incoming candle while a session is active."""
-        log.debug(f"Candle received during active session: {session_state.summary()}")
+        """Handle incoming candle during active session."""
+        log.debug(f"Candle during active session: {session_state.summary()}")
 
-    async def _alert_if_needed(self, alert_type: str, **kwargs):
+    async def _alert_skipped(self, pf_result, analysis_id, state):
         if self.alerts:
-            if alert_type == "analysis_skipped":
-                await self.alerts.analysis_skipped(**kwargs)
+            await self.alerts.analysis_skipped(
+                reason=pf_result.reason.value if pf_result.reason else "unknown",
+                confidence=0.0,
+                candle_id=analysis_id,
+            )
+
+    async def _log_analysis(
+        self,
+        analysis_id: str,
+        decision: GovernorDecision,
+        state: MarketState,
+        reflection: dict,
+        pf_result: PreFilterResult,
+        specialist_signals: dict[str, AgentSignal],
+    ):
+        advisor_call = "N/A"
+        advisor_confidence = 0.0
+        advisor_strength = "N/A"
+        if decision.advisor_reconciliation:
+            advisor_call = decision.advisor_reconciliation.get("advisor_call", "N/A")
+            advisor_confidence = decision.advisor_reconciliation.get("advisor_confidence", 0.0)
+            advisor_strength = decision.advisor_reconciliation.get("advisor_strength", "N/A")
+
+        await self.logger.log_analysis(
+            analysis_id=analysis_id,
+            timestamp=datetime.now(timezone.utc).isoformat(),
+            direction=decision.call,
+            confidence=decision.weighted_confidence,
+            confidence_bucket=decision.confidence_bucket,
+            signal_scores=decision.signal_scores,
+            advisor_call=advisor_call,
+            advisor_confidence=advisor_confidence,
+            advisor_strength=advisor_strength,
+            locked_direction=decision.call,
+            current_direction=decision.call,
+            pre_filter_reason=pf_result.reason.value if pf_result.reason else "PASSED",
+            reasoning_json=decision.analysis,
+            market_price=0.0,
+            market_url="",
+            c1_price=state.current_price,
+            c1_pattern=state.c1.candle_pattern if state.c1 else "N/A",
+            rsi_14=state.technical.rsi_14 if state.technical else 0.0,
+            vpin=state.vpin,
+            cvd=state.cvd,
+            funding_rate=state.smart_money.funding_rate_pct if state.smart_money else 0.0,
+            fear_greed=state.sentiment.fear_greed_index if state.sentiment else 50,
+            regime=reflection.get("regime", "UNKNOWN"),
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -715,14 +681,13 @@ class BTCPredictor:
 async def main():
     """Run the BTC Predictor."""
     import argparse
-    parser = argparse.ArgumentParser(description="BTC 15m Direction Predictor")
-    parser.add_argument("--live", action="store_true", help="Enable live trading (not paper)")
+    parser = argparse.ArgumentParser(description="BTC 15m Direction Predictor v4.0")
+    parser.add_argument("--live", action="store_true", help="Enable live trading")
     parser.add_argument("--dry-run", action="store_true", default=True)
     args = parser.parse_args()
 
     predictor = BTCPredictor(dry_run=not args.live)
 
-    # Handle signals
     loop = asyncio.get_event_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, lambda: asyncio.create_task(predictor.stop()))

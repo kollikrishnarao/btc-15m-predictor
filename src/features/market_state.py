@@ -365,7 +365,7 @@ class MarketStateAssembler:
             state.fear_greed_zone = "FEAR"
         elif state.fear_greed_index <= 55:
             state.fear_greed_zone = "NEUTRAL"
-        elif state.fear_greed_zone <= 75:
+        elif state.fear_greed_index <= 75:
             state.fear_greed_zone = "GREED"
         else:
             state.fear_greed_zone = "EXTREME_GREED"
