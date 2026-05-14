@@ -61,9 +61,8 @@ CVD vs Price divergence: {'YES' if (state.cvd > 0) != state.c1_is_green else 'NO
 Consecutive losses: {reflection.get('consecutive_losses', 0)}
 """
 
-    async def analyze(self, state: MarketState, reflection: dict) -> AgentSignal:
+    async def analyze(self, state: MarketState, reflection: dict) -> dict[str, AgentSignal]:
         """Produce an orderflow signal."""
-        # Compute VPIN-based score directly
         score, confidence = self._compute_orderflow_score(state)
         risk_flags = []
         if state.vpin > 0.70:
@@ -93,15 +92,17 @@ Consecutive losses: {reflection.get('consecutive_losses', 0)}
                  "TRENDING_DOWN" if state.cvd < -50 and state.vpin > 0.50 else \
                  "RANGING"
 
-        return AgentSignal(
-            dimension="orderflow",
-            score=round(score, 3),
-            confidence=round(confidence, 3),
-            regime=regime,
-            key_signals=key_signals,
-            contradictions=[f"CVD divergence from C1" if divergence else ""],
-            risk_flags=risk_flags,
-        )
+        return {
+            "orderflow": AgentSignal(
+                dimension="orderflow",
+                score=round(score, 3),
+                confidence=round(confidence, 3),
+                regime=regime,
+                key_signals=key_signals,
+                contradictions=[f"CVD divergence from C1" if divergence else ""],
+                risk_flags=risk_flags,
+            )
+        }
 
     def _compute_orderflow_score(self, state: MarketState) -> tuple[float, float]:
         """Compute orderflow score from VPIN, CVD, TCR, OBI, OFI."""
@@ -125,31 +126,33 @@ Consecutive losses: {reflection.get('consecutive_losses', 0)}
             else:
                 score -= 0.08
 
-        # CVD contribution
+        # CVD contribution — clamp to ±0.20 per metric
         if abs(state.cvd) > 200:
             weight += 0.25
-            score += (state.cvd / 400) * 0.25
+            cvd_delta = (state.cvd / 400) * 0.25
+            score += max(-0.20, min(0.20, cvd_delta))
         elif abs(state.cvd) > 100:
             weight += 0.15
-            score += (state.cvd / 400) * 0.15
+            cvd_delta = (state.cvd / 400) * 0.15
+            score += max(-0.20, min(0.20, cvd_delta))
 
-        # TCR contribution
+        # TCR contribution — clamp to ±0.15 per metric
         if abs(state.tcr) > 0.15:
             weight += 0.15
-            score += state.tcr * 0.15
+            score += max(-0.15, min(0.15, state.tcr * 0.15))
         elif abs(state.tcr) > 0.05:
             weight += 0.08
-            score += state.tcr * 0.08
+            score += max(-0.08, min(0.08, state.tcr * 0.08))
 
-        # OBI contribution
+        # OBI contribution — clamp to ±0.15 per metric
         if abs(state.obi) > 0.25:
             weight += 0.15
-            score += state.obi * 0.15
+            score += max(-0.15, min(0.15, state.obi * 0.15))
 
-        # OFI contribution
+        # OFI contribution — clamp to ±0.10 per metric
         if abs(state.ofi) > 0.05:
             weight += 0.10
-            score += (state.ofi / 0.1) * 0.10
+            score += max(-0.10, min(0.10, (state.ofi / 0.1) * 0.10))
 
         # Normalize
         if weight > 0:

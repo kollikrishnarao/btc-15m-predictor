@@ -98,22 +98,55 @@ OBI = (Bid_total - Ask_total) / (Bid_total + Ask_total)
 
 ## Architecture
 
+### Agent System
+
 ```
-src/data_sources/binance_client.py    — Binance WS + REST (candles, trades, orderbook, funding, OI)
-src/features/market_state.py          — MarketStateAssembler (parallel fetch → enriched packet)
-src/features/technical_indicators.py  — RSI, MACD, VWAP, BB, ATR, Supertrend, ADX, EMA, KDJ
-src/pre_filter.py                     — Hard rules BEFORE any LLM call
-src/agents/advisor.py                 — Advisor Agent (Claude Opus 4.7, max thinking, parallel)
-src/reasoning_prompt.py               — Main reasoning engine (Opus 4.7)
+src/agents/base/base_agent.py              — Agent ABC (call_llm, parse_signal_json)
+src/agents/specialists/quant_master.py     — Momentum + Trend (hybrid code+LLM)
+src/agents/specialists/flow_master.py      — Orderflow (hybrid code+LLM)
+src/agents/specialists/macro_monarch.py    — Smart Money + Macro (hybrid code+LLM)
+src/agents/specialists/sentiment_scout.py  — Sentiment (hybrid code+LLM)
+src/agents/advisor.py                      — Independent cross-validator (Opus 4.7 + thinking)
+src/agents/governor/governor.py            — Final decision: arithmetic + LLM synthesis
+src/data_quality.py                        — Data quality gate (validates MarketState)
+```
+
+**Phase 2 changes:**
+- Each specialist returns `dict[str, AgentSignal]` (one per dimension owned)
+- Governor uses regime-adaptive weight profiles (`REGIME_WEIGHT_PROFILES`)
+- Governor adds interaction terms: confirmation bonus, divergence penalty, consensus floor
+- Governor LLM synthesis step calls Sonnet 4.6 for final judgment (10s timeout, falls back to arithmetic)
+
+### Data Layer
+
+```
+src/data_sources/binance_client.py    — Binance WS + REST (SOCKS5 proxy supported)
+src/features/market_state.py          — MarketStateAssembler
+src/features/technical_indicators.py  — RSI, MACD, VWAP, BB, ATR, Supertrend, ADX, EMA
+src/pre_filter.py                     — Hard rules (runs BEFORE agents)
+src/session.py                         — 3-bet state machine, JSON persistence
 src/dynamic_flip.py                    — Flip evaluation after C2/C3 loss
-src/session.py                         — 3-bet state machine ($1→$2→$4), JSON persistence
-src/execution/polymarket_client.py    — Polymarket CLOB (market discovery, order placement)
-src/prediction_logger.py              — CSV logger + rolling stats + reflection context
-src/alerts/telegram_alerts.py         — Telegram bot (all session lifecycle events)
-src/event_loop.py                     — Main orchestrator (15m cycle coordinator)
+src/event_loop.py                     — Main orchestrator (15m cycle)
+src/execution/polymarket_client.py    — Polymarket CLOB API
+src/prediction_logger.py              — CSV logger + rolling stats + reflection
+src/alerts/telegram_alerts.py         — Telegram bot
 config/constants.py                    — All thresholds, API keys, paths
-tests/                                — pytest unit + integration tests
+tests/                                — 79 tests (all passing)
 ```
+
+### Conviction Scoring (Regime-Adaptive)
+
+Default weights: momentum=0.25, trend=0.20, orderflow=0.20, smart_money=0.15, sentiment=0.10, macro=0.10
+
+Profiles by regime (TRENDING_UP, RANGING, VOLATILE, RISK_ON, RISK_OFF, UNKNOWN):
+- TRENDING: momentum + trend get higher weight
+- RANGING: orderflow + smart_money get higher weight
+- VOLATILE: orderflow + smart_money get higher weight
+
+Interaction terms:
+- Confirmation bonus: orderflow + momentum agree → +0.05 max
+- Divergence penalty: any dimension gap > 0.30 → penalty
+- Consensus bonus: all dims loosely agree → bonus
 
 ## Key Docs
 

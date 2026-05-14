@@ -24,6 +24,7 @@ from src.agents.specialists.flow_master import FlowMaster
 from src.agents.specialists.macro_monarch import MacroMonarch
 from src.agents.specialists.sentiment_scout import SentimentScout
 from src.data_sources.binance_client import BinanceClient, Candle
+from src.data_quality import validate_market_state
 from src.dynamic_flip import FlipDecision, evaluate_flip
 from src.execution.polymarket_client import PolymarketClient
 from src.features.market_state import MarketState, MarketStateAssembler
@@ -199,6 +200,13 @@ class BTCPredictor:
             await self._handle_active_session(candle, session_state)
             return
 
+        # ── Step 2b: Data quality gate ────────────────────────────────────
+        dq = validate_market_state(state)
+        dq.log()
+        if not dq.passed:
+            log.error(f"Data quality failed — skipping analysis: {dq.failures}")
+            return
+
         # ── Step 3: Pre-filter ─────────────────────────────────────────────
         reflection = await self.logger.get_reflection_context()
         pf_result = run_pre_filter(
@@ -235,7 +243,7 @@ class BTCPredictor:
         state: MarketState,
         reflection: dict,
     ) -> dict[str, AgentSignal]:
-        """Run all specialist agents in parallel."""
+        """Run all specialist agents in parallel. Flatten per-dimension signals."""
         specialists = [
             ("quant", self.quant),
             ("flow_master", self.flow_master),
@@ -248,28 +256,23 @@ class BTCPredictor:
             if agent:
                 tasks[name] = asyncio.create_task(agent.analyze(state, reflection))
 
-        results = {}
+        # Flatten all specialist dicts into one signals dict keyed by dimension
+        signals: dict[str, AgentSignal] = {}
         for name, task in tasks.items():
             try:
-                signal = await task
-                results[name] = signal
-                log.debug(f"  {name.upper()}: score={signal.score:.3f} conf={signal.confidence:.2f}")
+                result = await task  # result is dict[str, AgentSignal]
+                for dim, sig in result.items():
+                    signals[dim] = sig
+                    log.debug(f"  [{dim.upper()}] {name}: score={sig.score:.3f} conf={sig.confidence:.2f}")
             except Exception as e:
                 log.warning(f"  {name.upper()} failed: {e}")
-                results[name] = AgentSignal(
-                    dimension=name,
-                    score=0.5,
-                    confidence=0.0,
-                    regime="UNKNOWN",
-                    key_signals=[f"Agent failed: {e}"],
-                )
 
-        # Fallback: if no specialists ran, use LLM reasoning engine directly
-        if not results:
-            log.warning("No specialists available — using fallback reasoning")
+        # Fallback: if no specialists produced signals, use LLM reasoning
+        if not signals:
+            log.warning("No specialists produced signals — using fallback reasoning")
             return await self._fallback_reasoning(state, reflection)
 
-        return results
+        return signals
 
     async def _fallback_reasoning(
         self,

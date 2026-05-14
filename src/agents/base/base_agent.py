@@ -67,8 +67,8 @@ class BaseAgent(ABC):
         ...
 
     @abstractmethod
-    async def analyze(self, state, reflection: dict) -> AgentSignal:
-        """Produce a signal for this dimension."""
+    async def analyze(self, state, reflection: dict) -> dict[str, AgentSignal]:
+        """Produce signals keyed by dimension name (one per dimension owned)."""
         ...
 
     @abstractmethod

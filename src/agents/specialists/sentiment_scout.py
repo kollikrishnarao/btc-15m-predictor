@@ -59,7 +59,7 @@ Social hype: {sentiment.social_hype_score:.2f}
 Reflect: {reflection.get('last_20_outcomes_formatted', 'N/A')}
 """
 
-    async def analyze(self, state: MarketState, reflection: dict) -> AgentSignal:
+    async def analyze(self, state: MarketState, reflection: dict) -> dict[str, AgentSignal]:
         """Produce a sentiment signal."""
         score, confidence = self._compute_sentiment_score(state)
         sentiment = state.sentiment or type('obj', (object,), {
@@ -74,12 +74,12 @@ Reflect: {reflection.get('last_20_outcomes_formatted', 'N/A')}
         fg = sentiment.fear_greed_index
         if fg <= 25:
             key_signals.append(f"EXTREME FEAR ({fg}) — contrarian buy setup")
-            score = min(score, 0.35)
+            score = max(score, 0.65)  # Bullish contrarian: extreme fear = bullish
         elif fg <= 45:
             key_signals.append(f"FEAR zone ({fg})")
         elif fg >= 75:
-            key_signals.append(f"EXTREME GREED ({fg}) — caution")
-            score = max(score, 0.65)
+            key_signals.append(f"EXTREME GREED ({fg}) — contrarian caution, reversal risk")
+            score = min(score, 0.35)  # Bearish contrarian: extreme greed = bearish
         elif fg >= 55:
             key_signals.append(f"GREED zone ({fg})")
 
@@ -99,14 +99,16 @@ Reflect: {reflection.get('last_20_outcomes_formatted', 'N/A')}
         if sentiment.btc_dominance > 58:
             risk_flags.append("Very high BTC dominance — alt coin risk-off")
 
-        return AgentSignal(
-            dimension="sentiment",
-            score=round(score, 3),
-            confidence=round(confidence, 3),
-            regime=sentiment.fear_greed_zone or "NEUTRAL",
-            key_signals=key_signals,
-            risk_flags=risk_flags,
-        )
+        return {
+            "sentiment": AgentSignal(
+                dimension="sentiment",
+                score=round(score, 3),
+                confidence=round(confidence, 3),
+                regime=sentiment.fear_greed_zone or "NEUTRAL",
+                key_signals=key_signals,
+                risk_flags=risk_flags,
+            )
+        }
 
     def _compute_sentiment_score(self, state: MarketState) -> tuple[float, float]:
         """Compute sentiment score from Fear & Greed and BTC dominance."""

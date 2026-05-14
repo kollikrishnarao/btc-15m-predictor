@@ -65,8 +65,8 @@ VIX: {macro.get('vix', 'N/A')} ({'risk-off' if macro.get('vix', 20) > 20 else 'r
 BTC macro score: {macro.get('btc_macro_score', 0.5):.2f}
 """
 
-    async def analyze(self, state: MarketState, reflection: dict) -> AgentSignal:
-        """Produce a macro + smart money signal."""
+    async def analyze(self, state: MarketState, reflection: dict) -> dict[str, AgentSignal]:
+        """Produce signals for SMART_MONEY and MACRO dimensions."""
         score, confidence = self._compute_macro_score(state)
         sm = state.smart_money or type('obj', (object,), {
             'funding_rate_pct': 0.0,
@@ -113,14 +113,24 @@ BTC macro score: {macro.get('btc_macro_score', 0.5):.2f}
                  "RISK_OFF" if macro.risk_off or macro.vix > 25 else \
                  "NEUTRAL"
 
-        return AgentSignal(
-            dimension="macro_smart_money",
-            score=round(score, 3),
-            confidence=round(confidence, 3),
-            regime=regime,
-            key_signals=key_signals,
-            risk_flags=risk_flags,
-        )
+        return {
+            "smart_money": AgentSignal(
+                dimension="smart_money",
+                score=round(score, 3),
+                confidence=round(confidence, 3),
+                regime=regime,
+                key_signals=key_signals[:5],
+                risk_flags=risk_flags[:3],
+            ),
+            "macro": AgentSignal(
+                dimension="macro",
+                score=round(score, 3),
+                confidence=round(confidence, 3),
+                regime=regime,
+                key_signals=key_signals[5:],
+                risk_flags=risk_flags[:2],
+            ),
+        }
 
     def _compute_macro_score(self, state: MarketState) -> tuple[float, float]:
         """Compute macro + smart money score."""

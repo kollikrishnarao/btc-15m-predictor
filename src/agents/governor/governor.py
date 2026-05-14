@@ -35,6 +35,60 @@ DIMENSION_WEIGHTS = {
     "macro": 0.10,
 }
 
+# Regime-adaptive weight profiles (Phase 2.4)
+REGIME_WEIGHT_PROFILES = {
+    "TRENDING_UP": {
+        "momentum": 0.30, "trend": 0.25, "orderflow": 0.15,
+        "smart_money": 0.15, "sentiment": 0.05, "macro": 0.10,
+    },
+    "TRENDING_DOWN": {
+        "momentum": 0.30, "trend": 0.25, "orderflow": 0.15,
+        "smart_money": 0.15, "sentiment": 0.05, "macro": 0.10,
+    },
+    "RANGING": {
+        "momentum": 0.15, "trend": 0.10, "orderflow": 0.30,
+        "smart_money": 0.20, "sentiment": 0.10, "macro": 0.15,
+    },
+    "VOLATILE": {
+        "momentum": 0.10, "trend": 0.10, "orderflow": 0.25,
+        "smart_money": 0.25, "sentiment": 0.15, "macro": 0.15,
+    },
+    "RISK_ON": {
+        "momentum": 0.25, "trend": 0.20, "orderflow": 0.20,
+        "smart_money": 0.15, "sentiment": 0.10, "macro": 0.10,
+    },
+    "RISK_OFF": {
+        "momentum": 0.20, "trend": 0.15, "orderflow": 0.20,
+        "smart_money": 0.20, "sentiment": 0.10, "macro": 0.15,
+    },
+    "NEUTRAL": {
+        "momentum": 0.25, "trend": 0.20, "orderflow": 0.20,
+        "smart_money": 0.15, "sentiment": 0.10, "macro": 0.10,
+    },
+    "UNKNOWN": {  # Fallback — same as default
+        "momentum": 0.25, "trend": 0.20, "orderflow": 0.20,
+        "smart_money": 0.15, "sentiment": 0.10, "macro": 0.10,
+    },
+}
+
+
+# ── Governor LLM Synthesis Prompt ────────────────────────────────────────
+
+GOVERNOR_SYNTHESIS_SYSTEM = """You are the GOVERNOR of a BTC 15-minute trading system.
+You have received signals from 4 specialist agents and 1 independent advisor.
+Synthesize these into a final trading decision.
+
+Score: 0.0=bearish, 0.5=neutral, 1.0=bullish
+Call: GREEN (score>0.5), RED (score<0.5), SKIP (score≈0.5 or contradictory)
+
+Return STRICT JSON:
+{
+    "call": "GREEN|RED|SKIP",
+    "confidence": 0.XX,
+    "regime": "TRENDING_UP|TRENDING_DOWN|RANGING|VOLATILE|UNKNOWN",
+    "risk_level": "LOW|MEDIUM|HIGH"
+}"""
+
 
 @dataclass
 class GovernorDecision:
@@ -112,10 +166,25 @@ class GovernorAgent:
         # Wait for advisor
         advisor_opinion = await advisor_task
 
-        # Reconcile
-        final_call, final_confidence = self._reconcile(
+        # Reconcile with arithmetic result
+        arithmetic_call, arithmetic_confidence = self._reconcile(
             weighted_confidence, advisor_opinion, specialist_signals
         )
+
+        # Phase 2.2: LLM synthesis — call Governor's own LLM for final judgment
+        synthesis = await self._synthesize(specialist_signals, advisor_opinion, arithmetic_call, arithmetic_confidence)
+
+        # Use LLM synthesis if it provides a confident override
+        if synthesis and synthesis.get("call"):
+            final_call = synthesis["call"]
+            final_confidence = synthesis.get("confidence", arithmetic_confidence)
+            if synthesis.get("regime") and synthesis["regime"] != "UNKNOWN":
+                regime = synthesis["regime"]
+            # Log override
+            if final_call != arithmetic_call:
+                log.info(f"Governor LLM OVERRIDE: {arithmetic_call} → {final_call}")
+        else:
+            final_call, final_confidence = arithmetic_call, arithmetic_confidence
 
         # Apply confidence gate
         bucket = self._confidence_bucket(final_confidence)
@@ -145,26 +214,48 @@ class GovernorAgent:
             latency_ms=latency,
         )
 
-    # Specialist dim → Governor dim mapping
-    _SPECIALIST_TO_DIM = {
-        "momentum": "momentum",
-        "orderflow": "orderflow",
-        "smart_money": "smart_money",
-        "sentiment": "sentiment",
-        "trend": "momentum",
-        "macro": "smart_money",
-    }
+    def _compute_weighted_confidence(self, signals: dict[str, AgentSignal], regime: str = "UNKNOWN") -> float:
+        """Compute weighted conviction from all specialist signals.
+        Phase 2.4: Uses regime-adaptive weights.
+        Phase 2.7: Adds interaction terms (confirmation bonus, divergence penalty, consensus floor).
+        """
+        # Select weight profile based on regime
+        weights = REGIME_WEIGHT_PROFILES.get(regime, REGIME_WEIGHT_PROFILES["UNKNOWN"])
 
-    def _compute_weighted_confidence(self, signals: dict[str, AgentSignal]) -> float:
-        """Compute weighted conviction from all specialist signals."""
-        total = 0.0
-        for dim, weight in DIMENSION_WEIGHTS.items():
-            mapped = self._SPECIALIST_TO_DIM.get(dim, dim)
-            if mapped in signals:
-                total += signals[mapped].score * weight
+        # Step 1: Base linear score
+        base = 0.0
+        for dim, weight in weights.items():
+            if dim in signals:
+                base += signals[dim].score * weight
             else:
-                total += 0.5 * weight  # Neutral if no signal
-        return round(total, 3)
+                base += 0.5 * weight
+
+        # Step 2: Confirmation bonus — orderflow and momentum agree
+        confirmation_bonus = 0.0
+        if "orderflow" in signals and "momentum" in signals:
+            agreement = 1.0 - abs(signals["orderflow"].score - signals["momentum"].score)
+            confirmation_bonus = agreement * 0.05  # Up to +0.05 when they fully agree
+
+        # Step 3: Divergence penalty — when any two dimensions strongly disagree
+        max_divergence = 0.0
+        dims = list(signals.keys())
+        for i, d1 in enumerate(dims):
+            for d2 in dims[i+1:]:
+                div = abs(signals[d1].score - signals[d2].score)
+                max_divergence = max(max_divergence, div)
+        divergence_penalty = max(0, (max_divergence - 0.30) * 0.10)
+
+        # Step 4: Consensus floor bonus — when all dimensions loosely agree
+        if len(signals) >= 3:
+            min_score = min(s.score for s in signals.values())
+            max_score = max(s.score for s in signals.values())
+            spread = max_score - min_score
+            consensus_bonus = max(0, (0.50 - spread) * 0.05)
+        else:
+            consensus_bonus = 0.0
+
+        final = base + confirmation_bonus - divergence_penalty + consensus_bonus
+        return round(max(0.0, min(1.0, final)), 3)
 
     def _compute_regime(self, signals: dict[str, AgentSignal]) -> str:
         """Infer market regime from specialist signals."""
@@ -183,30 +274,26 @@ class GovernorAgent:
     ) -> tuple[str, float]:
         """
         Reconcile engine confidence with advisor opinion.
-        - If advisor agrees or says SKIP: use engine confidence
-        - If advisor disagrees: use more conservative call unless engine > advisor by 0.15
+        - Derive engine direction from weighted confidence score (>0.5 = GREEN, <0.5 = RED)
+        - If advisor agrees: use higher confidence
+        - If advisor disagrees with engine significantly more confident (>0.15): use engine
+        - If advisor disagrees with similar confidence: use conservative call (SKIP or advisor)
         """
         if advisor.call == "SKIP":
             return "SKIP", engine_confidence
 
-        # Check if any dimension has extreme signal (supports the call)
-        extremes = sum(
-            1 for s in signals.values()
-            if s.score <= 0.30 or s.score >= 0.70
-        )
+        # Derive engine's directional call from weighted score
+        engine_direction = "GREEN" if engine_confidence > 0.5 else "RED"
 
-        if advisor.call == "SKIP":
-            return "SKIP", engine_confidence
-
-        if advisor.call == signals.get("momentum", AgentSignal("momentum", 0.5, 0.5, "UNKNOWN")).dimension:
-            # Advisor matches momentum direction
-            return advisor.call, max(engine_confidence, advisor.confidence)
+        if advisor.call == engine_direction:
+            # Agreement — use higher confidence
+            return engine_direction, max(engine_confidence, advisor.confidence)
 
         # Advisor disagrees
         gap = engine_confidence - advisor.confidence
         if gap > 0.15:
             # Engine significantly more confident — stay with engine
-            return signals.get("momentum", None) and "GREEN" or "RED", engine_confidence
+            return engine_direction, engine_confidence
         else:
             # Advisor disagrees with similar confidence — flip to advisor's call
             return advisor.call, advisor.confidence
@@ -263,6 +350,68 @@ class GovernorAgent:
         if state.vpin > 0.70:
             risks.append(f"VPIN elevated ({state.vpin:.3f}) — institutional uncertainty")
         return list(set(risks))[:5]
+
+    async def _synthesize(
+        self,
+        signals: dict[str, AgentSignal],
+        advisor: AdvisorOpinion,
+        arithmetic_call: str,
+        arithmetic_confidence: float,
+    ) -> dict:
+        """
+        Phase 2.2: Governor LLM synthesis — call Sonnet 4.6 to produce final judgment.
+        Timeout: 10 seconds. Falls back to arithmetic result on timeout or error.
+        """
+        if not self._client:
+            return {}
+
+        # Build summary of all signals
+        dim_lines = []
+        for dim, sig in signals.items():
+            conf_str = "high" if sig.confidence > 0.7 else "medium" if sig.confidence > 0.5 else "low"
+            dir_str = "BULLISH" if sig.score > 0.6 else "BEARISH" if sig.score < 0.4 else "NEUTRAL"
+            dim_lines.append(f"  {dim}: score={sig.score:.2f} conf={conf_str} ({dir_str}) regime={sig.regime}")
+
+        specialist_summary = "\n".join(dim_lines) if dim_lines else "No specialist signals available"
+
+        user_prompt = f"""## Specialist Signals
+{specialist_summary}
+
+## Advisor Opinion
+Call: {advisor.call} | Confidence: {advisor.confidence:.2f} | Strength: {advisor.advisor_strength}
+Key signals: {', '.join(advisor.key_signals[:3]) if advisor.key_signals else 'None'}
+
+## Arithmetic Baseline
+Weighted confidence: {arithmetic_confidence:.3f}
+Direction from arithmetic: {arithmetic_call}
+
+## Your Task
+Synthesize all signals above. Identify contradictions, assess trustworthiness
+of the arithmetic score, and make a final call. Return STRICT JSON."""
+
+        try:
+            resp = await asyncio.wait_for(
+                self._client.messages.create(
+                    model=self.model,
+                    max_tokens=self.max_tokens,
+                    temperature=self.temperature,
+                    system=GOVERNOR_SYNTHESIS_SYSTEM,
+                    messages=[{"role": "user", "content": user_prompt}],
+                ),
+                timeout=10.0,
+            )
+            raw = ""
+            for block in resp.content:
+                if block.type == "text":
+                    raw += block.text
+            parsed = self.parse_signal_json(raw)
+            return parsed or {}
+        except asyncio.TimeoutError:
+            log.warning("Governor synthesis timed out — using arithmetic result")
+            return {}
+        except Exception as e:
+            log.error(f"Governor synthesis failed: {e}")
+            return {}
 
     async def execute_decision(
         self,

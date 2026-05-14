@@ -89,121 +89,174 @@ Consecutive losses: {reflection.get('consecutive_losses', 0)}
 Last outcomes: {reflection.get('last_20_outcomes_formatted', 'N/A')}
 """
 
-    async def analyze(self, state: MarketState, reflection: dict) -> AgentSignal:
-        """Produce a technical analysis signal."""
+    async def analyze(self, state: MarketState, reflection: dict) -> dict[str, AgentSignal]:
+        """Produce signals for MOMENTUM and TREND dimensions."""
         if not state.technical or not state.c1:
-            return AgentSignal(
-                dimension="momentum_trend",
-                score=0.5,
-                confidence=0.0,
-                regime="UNKNOWN",
-                key_signals=["Insufficient data"],
-            )
+            return {
+                "momentum": AgentSignal(dimension="momentum", score=0.5, confidence=0.0, regime="UNKNOWN", key_signals=["Insufficient data"]),
+                "trend": AgentSignal(dimension="trend", score=0.5, confidence=0.0, regime="UNKNOWN", key_signals=["Insufficient data"]),
+            }
 
-        # Fast path: compute score directly from indicators (no LLM needed for simple cases)
-        # Use LLM only for complex multi-signal reconciliation
-        score, confidence = self._compute_technical_score(state)
+        # Compute per-dimension scores
+        mom_score, mom_conf = self._compute_momentum_score(state)
+        trend_score, trend_conf = self._compute_trend_score(state)
 
-        if 0.40 <= score <= 0.60 and confidence < 0.7:
-            # Ambiguous zone — use LLM for deeper analysis
+        # Ambiguous zone — use LLM for deeper analysis
+        if 0.40 <= mom_score <= 0.60 and 0.40 <= trend_score <= 0.60:
             prompt = self.build_prompt(state, reflection)
             raw, latency = await self.call_llm(prompt)
             parsed = self.parse_signal_json(raw)
-
             if parsed:
-                return AgentSignal(
-                    dimension="momentum_trend",
-                    score=float(parsed.get("score", 0.5)),
-                    confidence=float(parsed.get("confidence", 0.5)),
-                    regime=parsed.get("regime", "UNKNOWN"),
-                    key_signals=parsed.get("key_signals", []),
-                    contradictions=parsed.get("contradictions", []),
-                    risk_flags=parsed.get("risk_flags", []),
-                    raw_reasoning=raw,
-                    latency_ms=latency,
-                )
+                s = float(parsed.get("score", 0.5))
+                c = float(parsed.get("confidence", 0.5))
+                return {
+                    "momentum": AgentSignal(dimension="momentum", score=s, confidence=c, regime=parsed.get("regime", "UNKNOWN"), key_signals=parsed.get("key_signals", []), contradictions=parsed.get("contradictions", []), risk_flags=parsed.get("risk_flags", []), raw_reasoning=raw, latency_ms=latency),
+                    "trend": AgentSignal(dimension="trend", score=s, confidence=c, regime=parsed.get("regime", "UNKNOWN"), key_signals=parsed.get("key_signals", []), contradictions=parsed.get("contradictions", []), risk_flags=parsed.get("risk_flags", []), raw_reasoning=raw, latency_ms=latency),
+                }
 
-        return AgentSignal(
-            dimension="momentum_trend",
-            score=round(score, 3),
-            confidence=round(confidence, 3),
-            regime=self._infer_regime(state),
-            key_signals=self._get_key_signals(state),
-            risk_flags=self._get_risk_flags(state),
-        )
+        regime = self._infer_regime(state)
+        return {
+            "momentum": AgentSignal(
+                dimension="momentum",
+                score=round(mom_score, 3),
+                confidence=round(mom_conf, 3),
+                regime=regime,
+                key_signals=self._get_momentum_signals(state),
+                risk_flags=self._get_risk_flags(state),
+            ),
+            "trend": AgentSignal(
+                dimension="trend",
+                score=round(trend_score, 3),
+                confidence=round(trend_conf, 3),
+                regime=regime,
+                key_signals=self._get_trend_signals(state),
+                risk_flags=self._get_risk_flags(state),
+            ),
+        }
 
-    def _compute_technical_score(self, state: MarketState) -> tuple[float, float]:
-        """Compute a technical score from indicators — no LLM needed."""
+    def _compute_momentum_score(self, state: MarketState) -> tuple[float, float]:
+        """Compute MOMENTUM score — RSI, MACD, RVOL, price velocity."""
         t = state.technical
         score = 0.5
         weight_total = 0.0
 
-        signals = []
-
-        # RSI
+        # RSI momentum
         if t.rsi_14 < 30:
-            score += 0.15; weight_total += 0.15
-            signals.append("RSI oversold")
+            score += 0.20; weight_total += 0.20
         elif t.rsi_14 > 70:
-            score -= 0.15; weight_total += 0.15
-            signals.append("RSI overbought")
+            score -= 0.20; weight_total += 0.20
         elif t.rsi_14 > 55:
-            score += 0.08; weight_total += 0.10
+            score += 0.10; weight_total += 0.15
         elif t.rsi_14 < 45:
-            score -= 0.08; weight_total += 0.10
+            score -= 0.10; weight_total += 0.15
 
-        # MACD histogram
+        # MACD histogram momentum
         if t.macd_histogram > 0:
-            score += 0.10; weight_total += 0.10
+            score += 0.15; weight_total += 0.15
             if t.macd_histogram_slope > 0:
                 score += 0.05; weight_total += 0.05
         else:
-            score -= 0.10; weight_total += 0.10
+            score -= 0.15; weight_total += 0.15
             if t.macd_histogram_slope < 0:
                 score -= 0.05; weight_total += 0.05
 
-        # Supertrend
-        if t.supertrend_up:
-            score += 0.15; weight_total += 0.15
-            signals.append("Supertrend UP")
-        else:
-            score -= 0.15; weight_total += 0.15
-            signals.append("Supertrend DOWN")
-
-        # EMA alignment
-        if t.ema_9 > t.ema_21 > t.ema_99:
-            score += 0.15; weight_total += 0.15
-            signals.append("Bullish EMA alignment")
-        elif t.ema_9 < t.ema_21 < t.ema_99:
-            score -= 0.15; weight_total += 0.15
-            signals.append("Bearish EMA alignment")
-
-        # ADX trend strength
-        if t.adx > 25:
-            weight_total += 0.10  # Confirms trend direction signal
-        elif t.adx < 15:
-            weight_total -= 0.05  # Reduces confidence
-
-        # BB position
-        if t.bb_position_pct > 0.85:
-            score -= 0.10; weight_total += 0.10
-            signals.append("Near upper BB")
-        elif t.bb_position_pct < 0.15:
+        # Price velocity
+        if t.price_velocity_5 > 0.5:
             score += 0.10; weight_total += 0.10
-            signals.append("Near lower BB")
+        elif t.price_velocity_5 < -0.5:
+            score -= 0.10; weight_total += 0.10
 
-        # C1 candle direction + conviction
+        # C1 body conviction
         if state.c1_is_green and state.c1_body_pct > 0.20:
             score += 0.10; weight_total += 0.10
         elif not state.c1_is_green and state.c1_body_pct > 0.20:
             score -= 0.10; weight_total += 0.10
 
         if weight_total > 0:
-            score = score / (weight_total / 0.75)  # Normalize around 0.5
-        score = max(0.1, min(0.9, score))
-
-        confidence = min(0.9, 0.5 + weight_total * 0.5)
+            actual_delta = score - 0.5
+            normalized_delta = (actual_delta / max(weight_total, 0.01)) * 0.40
+            score = 0.5 + normalized_delta
+        score = max(0.05, min(0.95, score))
+        confidence = min(0.90, 0.40 + weight_total)
         return score, confidence
+
+    def _compute_trend_score(self, state: MarketState) -> tuple[float, float]:
+        """Compute TREND score — Supertrend, ADX, EMA alignment, BB position."""
+        t = state.technical
+        score = 0.5
+        weight_total = 0.0
+
+        # Supertrend
+        if t.supertrend_up:
+            score += 0.20; weight_total += 0.20
+        else:
+            score -= 0.20; weight_total += 0.20
+
+        # EMA alignment
+        if t.ema_9 > t.ema_21 > t.ema_99:
+            score += 0.15; weight_total += 0.15
+        elif t.ema_9 < t.ema_21 < t.ema_99:
+            score -= 0.15; weight_total += 0.15
+
+        # ADX trend strength
+        if t.adx > 25:
+            weight_total += 0.15
+        elif t.adx < 15:
+            weight_total -= 0.05
+
+        # BB position
+        if t.bb_position_pct > 0.85:
+            score -= 0.10; weight_total += 0.10
+        elif t.bb_position_pct < 0.15:
+            score += 0.10; weight_total += 0.10
+
+        if weight_total > 0:
+            actual_delta = score - 0.5
+            normalized_delta = (actual_delta / max(weight_total, 0.01)) * 0.40
+            score = 0.5 + normalized_delta
+        score = max(0.05, min(0.95, score))
+        confidence = min(0.90, 0.40 + weight_total)
+        return score, confidence
+
+    def _get_momentum_signals(self, state: MarketState) -> list[str]:
+        t = state.technical
+        sigs = []
+        if t.rsi_14 < 30:
+            sigs.append(f"RSI-14 oversold ({t.rsi_14:.1f})")
+        elif t.rsi_14 > 70:
+            sigs.append(f"RSI-14 overbought ({t.rsi_14:.1f})")
+        if t.macd_histogram > 0:
+            sigs.append("MACD histogram positive")
+        if t.price_velocity_5 > 0.5:
+            sigs.append(f"Price velocity +{t.price_velocity_5:.3f}%")
+        elif t.price_velocity_5 < -0.5:
+            sigs.append(f"Price velocity {t.price_velocity_5:.3f}%")
+        if state.c1_is_green:
+            sigs.append(f"C1 GREEN {state.c1_body_pct:.2f}% body")
+        else:
+            sigs.append(f"C1 RED {state.c1_body_pct:.2f}% body")
+        return sigs
+
+    def _get_trend_signals(self, state: MarketState) -> list[str]:
+        t = state.technical
+        sigs = []
+        if t.supertrend_up:
+            sigs.append("Supertrend UP")
+        else:
+            sigs.append("Supertrend DOWN")
+        if t.ema_9 > t.ema_21 > t.ema_99:
+            sigs.append("Bullish EMA alignment")
+        elif t.ema_9 < t.ema_21 < t.ema_99:
+            sigs.append("Bearish EMA alignment")
+        if t.adx > 25:
+            sigs.append(f"ADX {t.adx:.1f} — strong trend")
+        elif t.adx < 15:
+            sigs.append(f"ADX {t.adx:.1f} — choppy")
+        if t.bb_position_pct > 0.85:
+            sigs.append("Near upper BB")
+        elif t.bb_position_pct < 0.15:
+            sigs.append("Near lower BB")
+        return sigs
 
     def _infer_regime(self, state: MarketState) -> str:
         t = state.technical
