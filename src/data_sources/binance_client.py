@@ -1,17 +1,21 @@
 """
 Binance data ingestion — REST + WebSocket for BTC/USDT 15m candles.
 Full data layer: OHLCV, orderbook, aggTrades, funding, OI, long/short ratio.
+
+Supports SOCKS5 proxy via BINANCE_PROXY env var (e.g., socks5://user:pass@host:port).
 """
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
+import os
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
 
 import aiohttp
+import aiohttp_socks  # SOCKS5 proxy support
 import websockets
 
 log = logging.getLogger(__name__)
@@ -248,11 +252,14 @@ class BinanceClient:
         self._order_book: Optional[OrderBook] = None
         self._book_ticker: dict = {}
         self._last_candle: Optional[Candle] = None
+        # SOCKS5 proxy support — set BINANCE_PROXY env var (e.g. socks5://user:pass@host:port)
+        proxy = os.getenv("BINANCE_PROXY", "")
+        self._connector = aiohttp_socks.ProxyConnector.from_url(proxy) if proxy else None
 
     # ── Session ───────────────────────────────────────────────────────────────
 
     async def __aenter__(self):
-        self._session = aiohttp.ClientSession()
+        self._session = aiohttp.ClientSession(connector=self._connector)
         return self
 
     async def __aexit__(self, *args):
