@@ -100,9 +100,11 @@ OBI = (Bid_total - Ask_total) / (Bid_total + Ask_total)
 
 ```
 src/data_sources/binance_client.py    — Binance WS + REST (candles, trades, orderbook, funding, OI)
+src/data_sources/twitter_sentiment.py — Twitter/X sentiment via twscrape (fallback: Nitter RSS)
 src/features/market_state.py          — MarketStateAssembler (parallel fetch → enriched packet)
 src/features/technical_indicators.py  — RSI, MACD, VWAP, BB, ATR, Supertrend, ADX, EMA, KDJ
 src/pre_filter.py                     — Hard rules BEFORE any LLM call
+src/mcp/twitter_mcp.py               — MCP server for X/Twitter research (Claude Code tool)
 src/agents/advisor.py                 — Advisor Agent (Claude Opus 4.7, max thinking, parallel)
 src/reasoning_prompt.py               — Main reasoning engine (Opus 4.7)
 src/dynamic_flip.py                    — Flip evaluation after C2/C3 loss
@@ -193,3 +195,8 @@ BINANCE_API_KEY/SECRET      — Binance (optional)
 - Funding rate: < 5 minutes (cached)
 - Macro (Yahoo): < 15 minutes (cached)
 - Fear & Greed: < 30 minutes (cached)
+- Twitter/X sentiment: fetched async, < 15s (non-blocking; failure is silent)
+
+## Twitter/X Integration
+
+Twitter/X sentiment is fetched asynchronously during market state assembly — it does NOT block the main analysis pipeline. Configure accounts in `src/data_sources/.twitter_accounts.json` (see twscrape docs). Without credentials, falls back to Nitter RSS for basic sentiment. The MCP server (`src/mcp/twitter_mcp.py`) exposes Twitter as a Claude Code tool for manual research.

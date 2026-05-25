@@ -81,6 +81,13 @@ class SentimentState:
     social_hype_score: float = 0.5
     fetched_at: Optional[datetime] = None
     stale: bool = True
+    # Twitter/X sentiment (populated by assembler if Twitter is configured)
+    twitter_score: float = 0.5
+    twitter_tweet_count: int = 0
+    twitter_bullish_count: int = 0
+    twitter_bearish_count: int = 0
+    twitter_engagement_rate: float = 0.0
+    twitter_error: Optional[str] = None
 
     @property
     def fear_greed_score(self) -> float:
@@ -341,7 +348,7 @@ class MarketStateAssembler:
         return state
 
     async def _fetch_sentiment(self) -> SentimentState:
-        """Fetch Fear & Greed Index and CoinGecko social data."""
+        """Fetch Fear & Greed Index and Twitter/X crypto sentiment in parallel."""
         state = SentimentState()
         try:
             async with self._session.get(
@@ -371,7 +378,29 @@ class MarketStateAssembler:
             state.fear_greed_zone = "EXTREME_GREED"
         state.fear_greed_trend = "NEUTRAL"
 
+        # Fetch Twitter sentiment in background — don't block market state
+        self._fetch_twitter_sentiment_async(state)
+
         return state
+
+    async def _fetch_twitter_sentiment_async(self, state: SentimentState):
+        """Fetch Twitter/X sentiment without blocking market state assembly."""
+        try:
+            from src.data_sources.twitter_sentiment import fetch_twitter_sentiment
+            result = await asyncio.wait_for(
+                fetch_twitter_sentiment(limit=20),
+                timeout=12.0,
+            )
+            state.twitter_score = result.score
+            state.twitter_tweet_count = result.tweet_count
+            state.twitter_bullish_count = result.bullish_count
+            state.twitter_bearish_count = result.bearish_count
+            state.twitter_engagement_rate = result.engagement_rate
+            state.twitter_error = result.error
+        except asyncio.TimeoutError:
+            state.twitter_error = "Twitter timeout (>12s)"
+        except Exception as e:
+            state.twitter_error = str(e)
 
     async def _build_smart_money(
         self,

@@ -1,11 +1,17 @@
 """
 SENTIMENT SCOUT — Sentiment & narrative specialist.
 Owns: SENTIMENT dimension.
+Supports Twitter/X as a secondary sentiment signal (via MCP or direct fetch).
 """
 from __future__ import annotations
 
+import logging
+from typing import Optional
+
 from src.agents.base.base_agent import AgentSignal, BaseAgent
 from src.features.market_state import MarketState
+
+log = logging.getLogger(__name__)
 
 
 class SentimentScout(BaseAgent):
@@ -28,7 +34,8 @@ Interpret Fear & Greed Index:
 - 55-75: GREED → slightly bullish
 - >75: EXTREME GREED → contrarian caution
 
-Also consider BTC dominance shifts and social volume.
+Also consider BTC dominance shifts, social volume, and Twitter/X crypto sentiment.
+Twitter is used as a secondary signal — confirm with Fear & Greed before acting on it alone.
 
 Return STRICT JSON:
 {
@@ -49,12 +56,24 @@ Return STRICT JSON:
             'btc_dominance': 50.0,
             'social_hype_score': 0.5,
         })()
+        twitter = getattr(state, 'twitter_sentiment', None)
+        twitter_block = ""
+        if twitter:
+            twitter_block = f"""
+Twitter/X Sentiment (secondary signal — confirm with Fear & Greed):
+- Score: {twitter.score:.3f} ({'bullish' if twitter.score > 0.6 else 'bearish' if twitter.score < 0.4 else 'neutral'})
+- Tweets analyzed: {twitter.tweet_count}
+- Bullish/Bearish ratio: {twitter.bullish_count}/{twitter.bearish_count}
+- Source: {twitter.source}
+- Engagement rate: {twitter.engagement_rate:.3f}
+- Confidence: {twitter.confidence:.3f}
+- Error: {twitter.error or 'none'}"""
         return f"""## SENTIMENT DATA
 
 Fear & Greed Index: {sentiment.fear_greed_index} — {sentiment.fear_greed_zone}
 Fear & Greed trend: {sentiment.fear_greed_trend}
 BTC Dominance: {sentiment.btc_dominance:.1f}%
-Social hype: {sentiment.social_hype_score:.2f}
+Social hype: {sentiment.social_hype_score:.2f}{twitter_block}
 
 Reflect: {reflection.get('last_20_outcomes_formatted', 'N/A')}
 """
@@ -71,7 +90,10 @@ Reflect: {reflection.get('last_20_outcomes_formatted', 'N/A')}
         })()
 
         key_signals = []
+        risk_flags = []
         fg = sentiment.fear_greed_index
+
+        # Fear & Greed zone signals
         if fg <= 25:
             key_signals.append(f"EXTREME FEAR ({fg}) — contrarian buy setup")
             score = min(score, 0.35)
@@ -93,7 +115,21 @@ Reflect: {reflection.get('last_20_outcomes_formatted', 'N/A')}
         elif sentiment.btc_dominance < 48:
             key_signals.append(f"BTC dominance {sentiment.btc_dominance:.1f}% — alt season rotation")
 
-        risk_flags = []
+        # Twitter sentiment — secondary signal
+        twitter = getattr(state, 'twitter_sentiment', None)
+        if twitter and twitter.tweet_count > 0 and not twitter.error:
+            bias = (twitter.score - 0.5) * 0.20  # ±0.10 adjustment
+            score = max(0.05, min(0.95, score + bias))
+            twitter_label = "bullish" if twitter.score > 0.6 else "bearish" if twitter.score < 0.4 else "neutral"
+            key_signals.append(
+                f"Twitter sentiment: {twitter_label} ({twitter.score:.2f}, "
+                f"{twitter.tweet_count} tweets, {twitter.bullish_count}B/{twitter.bearish_count}Be)"
+            )
+            if twitter.confidence >= 0.5:
+                confidence = min(0.85, confidence + twitter.confidence * 0.10)
+        elif twitter and twitter.error:
+            key_signals.append(f"Twitter fetch failed: {twitter.error} — using Fear & Greed only")
+
         if fg <= 20:
             risk_flags.append("Extreme fear — market capitulation possible")
         if sentiment.btc_dominance > 58:
